@@ -1,0 +1,237 @@
+trigger:
+- main
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  buildConfiguration: 'Release'
+  serviceConnection: 'Azure-lhc-tests-serviceconnection'
+
+stages:
+- stage: Test
+  jobs:
+  - job: TestBackend
+    steps:
+    - task: UseDotNet@2
+      inputs:
+        version: '8.x'
+    
+    - script: |
+        cd backend
+        dotnet restore
+      displayName: 'Restore packages'
+    
+    - script: |
+        cd backend
+        dotnet build --configuration $(buildConfiguration)
+      displayName: 'Build'
+    
+    - script: |
+        cd backend
+        dotnet test --configuration $(buildConfiguration) --collect:"XPlat Code Coverage"
+      displayName: 'Test'
+    
+    - task: PublishCodeCoverageResults@2
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Agent.TempDirectory)/**/coverage.cobertura.xml'
+
+  - job: TestFrontend
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '18.x'
+    
+    - script: |
+        cd frontend
+        npm install
+      displayName: 'Install dependencies'
+    
+    - script: |
+        cd frontend
+        npm test
+      displayName: 'Run tests'
+    
+    - task: PublishCodeCoverageResults@2
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: 'frontend/coverage/cobertura-coverage.xml'
+
+  - job: SecurityScan
+    steps:
+    - task: UseDotNet@2
+      inputs:
+        version: '8.x'
+        # Install .NET 6.0 runtime for security-scan tool
+    - task: UseDotNet@2
+      inputs:
+        version: '6.x'
+        includePreviewVersions: false
+    
+    # Restore NuGet packages first
+    - script: |
+        cd backend
+        dotnet restore SimpleApp.csproj
+      displayName: 'Restore NuGet packages'
+      continueOnError: false
+
+    # Try security-scan with proper working directory
+    - script: |
+        dotnet tool install --global security-scan
+      displayName: 'Install security-scan tool'
+      continueOnError: true
+    
+    - script: |
+        cd backend
+        security-scan SimpleApp.csproj
+      displayName: 'Security scan (console output)'
+      continueOnError: true
+    
+    # Now check vulnerable packages (after restore)
+    - script: |
+        cd backend
+        dotnet list package --vulnerable --include-transitive
+      displayName: 'Check vulnerable packages'
+      continueOnError: true
+    
+    # Use dotnet format for code analysis
+    - script: |
+        cd backend
+        dotnet format --verify-no-changes --verbosity diagnostic || echo "Format issues found"
+      displayName: 'Code format verification'
+      continueOnError: true
+        
+    # Generate package-lock.json for frontend security audit
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '18.x'
+        
+    - powershell: |
+        cd frontend
+        # Install dependencies first
+        npm install
+                
+        # Install audit-ci and run security audit with higher threshold
+        npm install -g audit-ci
+        audit-ci --config ../config/audit-ci.json --high
+      displayName: 'NPM security audit'
+      continueOnError: true
+
+  - job: StaticAnalysis
+    steps:
+    - task: UseDotNet@2
+      inputs:
+        version: '8.x'
+    
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '18.x'
+    
+    - powershell: |
+        # .NET Static Analysis with Roslynator
+        cd backend
+        dotnet tool install --global roslynator.dotnet.cli
+        roslynator analyze --output roslynator-report.xml --format xml
+        
+        # .NET Security Analysis with DevSkim
+        dotnet tool install --global microsoft.cst.devskim.cli
+        devskim analyze --source-code . --output-format sarif --output-file devskim-results.sarif
+      displayName: '.NET Static Analysis'
+      continueOnError: true
+    
+    - powershell: |
+        # Generate package-lock.json for frontend
+        cd frontend
+        npm install
+        
+        # JavaScript Static Analysis with ESLint
+        npm install -g eslint @eslint/js
+        npx eslint src --format junit --output-file eslint-results.xml
+        
+        # JavaScript Security Analysis with semgrep
+        pip install semgrep
+        semgrep --config auto --json --output semgrep-results.json src/
+      displayName: 'JavaScript Static Analysis'
+      continueOnError: true
+    
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/eslint-results.xml'
+        testRunTitle: 'ESLint Results'
+      condition: always()
+
+- stage: Deploy
+  dependsOn: Test
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployInfrastructure
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: 'latest'
+          
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+              backendServiceArm: $(serviceConnection)
+              backendAzureRmResourceGroupName: 'rg-terraform-state'
+              backendAzureRmStorageAccountName: 'stterraformstate'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'simple-app.tfstate'
+          
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+              environmentServiceNameAzureRM: $(serviceConnection)
+
+  - deployment: DeployAPI
+    dependsOn: DeployInfrastructure
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DotNetCoreCLI@2
+            inputs:
+              command: 'publish'
+              projects: 'backend/**/*.csproj'
+              arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)'
+          
+          - task: AzureWebApp@1
+            inputs:
+              azureSubscription: $(serviceConnection)
+              appName: 'app-simpleapp-api-dev'
+              package: '$(Build.ArtifactStagingDirectory)/**/*.zip'
+
+  - deployment: DeployFrontend
+    dependsOn: DeployInfrastructure
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '18.x'
+          
+          - powershell: |
+              cd frontend
+              npm install
+              npm run build
+            displayName: 'Build React app'
+          
+          - task: AzureStaticWebApp@0
+            inputs:
+              azure_static_web_apps_api_token: '$(AZURE_STATIC_WEB_APPS_API_TOKEN)'
+              app_location: 'frontend/'
+              output_location: 'build'

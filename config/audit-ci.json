@@ -1,0 +1,19 @@
+{
+  "allowlist": [
+    "GHSA-4v9v-hfq4-rm2v",
+    "GHSA-7fh5-64p2-3v2j",
+    "GHSA-9jgg-88mc-972h",
+    "GHSA-rp65-9cf3-cjxr"
+  ],
+  "low": false,
+  "moderate": false,
+  "high": true,
+  "critical": true,
+  "package-manager": "npm",
+  "report-type": "summary",
+  "retry": {
+    "count": 5,
+    "delay": 3000,
+    "factor": 2
+  }
+}

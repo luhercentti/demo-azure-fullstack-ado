@@ -1,0 +1,8 @@
+# Ignore frontend coverage reports
+frontend/coverage/
+
+# Ignore node modules
+frontend/node_modules/
+
+# Ignore lock file
+frontend/package-lock.json
